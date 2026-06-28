@@ -1,0 +1,16 @@
+# build artifacts
+build/
+minidb
+minidb_tests
+minidb_bench
+
+# database files produced at runtime
+*.db
+*.wal
+*.meta
+minidb_data/
+/bench_*
+/mydb*
+/demo*.db
+/demo*.wal
+/demo*.meta
