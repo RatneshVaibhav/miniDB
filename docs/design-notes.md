@@ -112,6 +112,16 @@ underfull nodes** (no merge/redistribute). This keeps search, insert, and range
 scans fully correct — an underfull leaf is still a valid, navigable leaf — while
 avoiding the trickiest B+Tree code. The only cost is space, not correctness.
 
+**Unique vs non-unique.** The tree carries a `unique_` flag. A **primary-key**
+index is unique (duplicate inserts are rejected, enforcing the key constraint). A
+**secondary** index is non-unique: many rows can share a key value (e.g. many
+students in `branch = 'cse'`), so inserts allow duplicates, a point lookup is a
+**range scan over equal keys** returning all matching RIDs, and deletion removes
+the exact `(key, rid)` pair (not just the first match). To make range scans see
+all duplicates even across a leaf split, the lower-bound descent takes the *left*
+branch on equality (`FindLeafForScan`) and then scans forward through the linked
+leaves.
+
 ---
 
 ## 4. Indexes are derived, not logged

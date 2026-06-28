@@ -139,6 +139,23 @@ minidb> SELECT * FROM t;        -- rows are still there, recovered from the WAL
 minidb> .exit
 ```
 
+**Showing steal (UNDO) and no-force (REDO) separately.** The 2nd CLI argument
+sets the buffer-pool size; a small pool forces dirty *uncommitted* pages to be
+**stolen** to disk so undo is genuinely exercised.
+
+```bash
+# No-force -> REDO: committed rows are NOT flushed at commit, yet survive the crash
+./minidb redodemo  < docs/demos/demo_redo_noforce.sql      # 3 committed rows come back
+
+# Steal -> UNDO: a big UNCOMMITTED txn with an 8-frame pool spills to disk, then is undone
+./minidb stealdemo 8 < docs/demos/demo_undo_steal.sql      # 2003 rows before crash -> 3 after
+```
+"With only 8 frames, the 2000-row uncommitted insert overflowed the pool, so dirty
+uncommitted pages were *stolen* to disk (the data file grows to ~90 pages). After
+the crash, **UNDO** rolled them back to the 3 committed rows. **No-force** means we
+never flushed committed pages at commit, so they came back only via **REDO** from
+the WAL."
+
 ---
 
 ## 6. Extension Track C — LSM vs B+Tree (2 min)
@@ -170,6 +187,8 @@ and compaction bounds space amplification."
 | Interactive shell | `./minidb mydb` |
 | Concurrency + deadlock | `make condemo` |
 | Crash + recovery | `./minidb crashdemo < docs/demos/demo_recovery.sql` |
+| No-force → REDO | `./minidb redodemo < docs/demos/demo_redo_noforce.sql` |
+| Steal → UNDO (small pool) | `./minidb stealdemo 8 < docs/demos/demo_undo_steal.sql` |
 | Benchmarks (LSM/B+Tree, index, buffer pool) | `make bench` |
 | Reset all demo data | `make clean` (or `rm -f *.db *.wal *.meta`) |
 

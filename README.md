@@ -280,14 +280,16 @@ libraries.
 
 **Build.**
 ```bash
-make            # builds: minidb (CLI), minidb_tests, minidb_bench
+make            # builds: minidb (CLI), minidb_tests, minidb_bench, minidb_condemo
 make test       # run the full test suite (33 tests)
 make bench      # run the benchmark harness
+make condemo    # live concurrency + deadlock demo
 make run        # launch the interactive REPL
 make clean
 ```
 
-**Interactive example.**
+**Interactive example.** End every statement with `;`. Strings use `'single'`
+(or `"double"`) quotes; `-- ...` starts a comment.
 ```bash
 ./minidb mydb            # data persists in mydb.db / mydb.wal / mydb.meta
 minidb> CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(20), age INT);
@@ -297,13 +299,20 @@ minidb> EXPLAIN SELECT name FROM users WHERE id = 1;
 minidb> .crash            -- simulate power loss, then auto-recover
 minidb> .exit
 ```
+An optional 2nd argument sets the buffer-pool size (frames) — shrink it to force
+page eviction for the steal/recovery demo: `./minidb mydb 8`.
 
 **Scripted demos** (in [docs/demos/](docs/demos/)):
 ```bash
-./minidb demo < docs/demos/demo_core.sql        # CRUD, joins, aggregates, EXPLAIN
-./minidb demo < docs/demos/demo_recovery.sql    # crash + WAL recovery
+./minidb demo  < docs/demos/demo_viva.sql           # CRUD, joins, aggregates, EXPLAIN
+./minidb demo  < docs/demos/demo_recovery.sql       # crash + WAL recovery
+./minidb r 8   < docs/demos/demo_undo_steal.sql     # steal -> UNDO (small pool forces eviction)
+./minidb r     < docs/demos/demo_redo_noforce.sql   # no-force -> REDO (committed survives)
 ```
 
-See [docs/architecture.md](docs/architecture.md) and
-[docs/design-notes.md](docs/design-notes.md) for deeper internals and the
-design rationale used in the viva.
+**Documentation.**
+- [NOTES.md](NOTES.md) — full plain-English explanation of every folder + viva Q&A.
+- [docs/DEMO_GUIDE.md](docs/DEMO_GUIDE.md) — step-by-step live demo script.
+- [docs/architecture.md](docs/architecture.md) — internals deep-dive.
+- [docs/design-notes.md](docs/design-notes.md) — design decisions & trade-offs.
+- [REPORT.md](REPORT.md) — formal project report + benchmark report.
