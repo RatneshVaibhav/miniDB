@@ -24,6 +24,9 @@ system.
 9. [⭐ SIMPLE VERSION — everything with everyday analogies](#9--simple-version--everything-with-everyday-analogies)
    *(start here if section 8 feels heavy)*
 10. [Algorithms & design decisions (quick reference)](#10-algorithms--design-decisions-quick-reference)
+11. [⭐ EXTENDED DEEP DIVES — LSM & MVCC (viva special)](#11--extended-deep-dives--lsm--mvcc-viva-special)
+    - [11.1 LSM-tree — complete deep dive](#111-lsm-tree--complete-deep-dive)
+    - [11.2 MVCC — complete deep dive](#112-mvcc--complete-deep-dive)
 
 ---
 
@@ -1263,3 +1266,321 @@ We chose **Track C** because it contrasts most cleanly with the core B+Tree
 storage and produces a clear, measurable benchmark (write throughput, read
 latency, space amplification). That is also why we use **Volcano** execution (not
 vectorized = Track A) and **2PL** (not MVCC = Track B).
+
+---
+
+# 11. ⭐ EXTENDED DEEP DIVES — LSM & MVCC (viva special)
+
+The two most-likely deep-questioning topics, explained thoroughly. Read 8.4/9 for
+the gentle version first; this is the "go deeper" version with internals, math,
+trade-offs, complexity, real systems, and Q&A.
+
+---
+
+## 11.1 LSM-tree — complete deep dive
+
+### One-line definition
+An **LSM-tree (Log-Structured Merge tree)** is a storage structure that makes
+**writes sequential** by buffering them in memory and flushing them as **sorted,
+immutable files**, then periodically **merging** those files in the background.
+
+### Why it exists — the hardware story
+Disks (and even SSDs) are **much faster at sequential I/O than random I/O**. A
+B+Tree updates the exact leaf for each key → **random** writes scattered across
+the disk. An LSM turns every write into an **append to memory** and later a
+**sequential bulk flush** → far higher write throughput and less SSD wear. The
+cost it accepts: a read may have to look in several places.
+
+This is the fundamental **read-vs-write trade-off**, and LSM deliberately sits on
+the write-optimized side.
+
+### Full architecture
+```
+          WRITES                                 READS (newest → oldest)
+            │                                          │
+            ▼                                          ▼ ask each, stop at first hit
+   ┌───────────────────┐                     ┌──────────────────────────┐
+   │  MemTable (RAM)    │  sorted map         │ 1. MemTable               │
+   │  key → val/tomb    │◄────── Put/Delete   │ 2. SSTable_n (newest) ─┐  │
+   └─────────┬──────────┘                     │ 3. SSTable_n-1         │  │ each gated
+             │ full → flush (sequential)      │      ...               ├──┤ by a BLOOM
+             ▼                                 │ k. SSTable_0 (oldest) ─┘  │ FILTER
+   ┌───────────────────┐                       └──────────────────────────┘
+   │ SSTable (on disk) │  immutable, sorted,            │
+   │ + bloom + index   │  newest on top                 │ too many SSTables?
+   └─────────┬──────────┘                               ▼
+             └──────────────────────► COMPACTION: merge → keep newest per key,
+                                       drop tombstones → one fresh SSTable
+```
+In our code: [`LSMEngine`](src/lsm/lsm_engine.cpp), [`SSTable`](src/lsm/sstable.cpp),
+[`BloomFilter`](src/lsm/bloom_filter.h).
+
+### The write path (step by step)
+1. `Put(key, value)` / `Delete(key)` inserts into the **MemTable** — an in-memory
+   `std::map` (a balanced BST), so it's sorted and O(log n) but in RAM (fast).
+   A delete inserts a **tombstone** (a "deleted" marker), not a real removal.
+2. When the MemTable reaches its size limit (`memtable_limit_`), **Flush** writes
+   the whole map, in sorted order, to a **new SSTable file** in one sequential
+   pass, then clears the MemTable.
+3. After a flush, if the number of SSTables exceeds `compaction_trigger_`, run
+   **compaction**.
+
+Key property: a write never seeks around the disk — it's an in-memory insert plus
+(occasionally) one sequential file write. That's the throughput win.
+
+### The read path (step by step) — and why it can be slower
+1. Check the **MemTable** first (it has the newest writes).
+2. If not found, check **SSTables newest → oldest**.
+3. For each SSTable, first consult its **bloom filter**: if it says "definitely
+   not here," **skip the file** (no disk read). Otherwise look the key up via the
+   SSTable's in-memory key→offset index and read the record.
+4. **First hit wins.** If that record is a **tombstone**, return "not found."
+
+A point read may touch up to *(number of SSTables)* files — that's **read
+amplification** — which bloom filters cut down dramatically, but don't eliminate.
+
+### SSTable file format (ours, exactly)
+```
+[magic u32][count u32]
+repeat count times, sorted by key:
+   [keylen u32][key bytes][type u8: 0=value,1=tombstone][vallen u32][value bytes]
+```
+On `Open`, we scan once to build an in-memory **key → file-offset index** and a
+**bloom filter**. (Production SSTables add data blocks, a block index, and a
+footer for partial loading; ours keeps the whole key index in memory — simpler,
+fine at our scale.)
+
+### Bloom filter — the math (great to know)
+A bloom filter is a bit array of `m` bits with `k` hash functions. `Add` sets `k`
+bits; a lookup checks those `k` bits.
+- **No false negatives** (if any of the `k` bits is 0, the key is definitely
+  absent) → safe to skip the SSTable.
+- **Some false positives** with probability ≈ `(1 − e^(−kn/m))^k`, where `n` =
+  number of keys.
+- We use ≈ **10 bits per key** (`m = max(64, 10·n)`) and **k = 4** hashes → about
+  a **1% false-positive rate** (a wasted lookup ~1% of the time — slower, never
+  wrong). We synthesise the `k` hashes by **double hashing**:
+  `hash_i = h1 + i·h2` (h1 = `std::hash`, h2 = FNV-1a).
+
+### Tombstones & the "resurrection" subtlety
+Because SSTables are immutable, a delete can't erase the old value — it writes a
+**tombstone** that *shadows* older versions on read. The tombstone must live until
+**every** older copy of that key has been compacted away; if it were dropped too
+early, an old value could "resurrect." That's why tombstones are only safely
+dropped during a **bottom-level (full) compaction** — which is exactly what ours
+does.
+
+### Compaction — strategies compared
+| Strategy | How it works | Write amp | Read amp | Space amp | Used by |
+| -------- | ------------ | --------- | -------- | --------- | ------- |
+| **Size-tiered** (ours) | when several similar-size SSTables pile up, merge them into one bigger one | lower | higher (more overlapping files) | higher | Cassandra (default) |
+| **Leveled** | keep sorted, non-overlapping files per level; each level ~10× bigger | higher | lower (≤1 file per level per key) | lower | RocksDB/LevelDB |
+
+Our `Compact()` does a **full size-tiered merge**: read all current SSTables,
+**k-way merge** them keeping the **newest version of each key**, **drop
+tombstones**, write one new SSTable, delete the old files. This is the simplest
+strategy that clearly demonstrates **space reclamation** (our benchmark shows
+~5× reclaimed after a 5× overwrite).
+
+### The three amplifications + the RUM conjecture
+- **Read amplification** — extra reads per query (multiple SSTables). Bloom +
+  compaction reduce it.
+- **Write amplification** — data rewritten by compaction (a key may be copied
+  several times over its life). LSM's main cost.
+- **Space amplification** — obsolete/duplicate versions on disk until compaction.
+The **RUM conjecture** says you can optimise at most two of *Read, Update, Memory
+(space)* at once — LSM trades some read amp for great write & space behaviour.
+
+### Complexity (rough)
+| Operation | LSM | B+Tree |
+| --------- | --- | ------ |
+| Write | O(log n) in RAM + amortised sequential flush/compaction | O(log n) with **random** disk I/O |
+| Point read | O(#SSTables) lookups, bloom-gated (usually ~1) | O(log n), one cached descent |
+| Range read | merge across MemTable + SSTables | follow linked leaves (very good) |
+| Space | compact (dense sorted files) | ~70% full nodes (looser) |
+
+### Our implementation — specifics & honest limits
+- Code: `Put/Get/Delete/Flush/Compact/MaybeFlush` in
+  [`lsm_engine.cpp`](src/lsm/lsm_engine.cpp); `Create/Open/Get/ScanAll` in
+  [`sstable.cpp`](src/lsm/sstable.cpp); bloom in
+  [`bloom_filter.h`](src/lsm/bloom_filter.h).
+- **Limits (be ready to state these):** the MemTable is **not** separately
+  WAL-backed, so unflushed writes are lost on a crash; the engine is a
+  **standalone key-value store used for benchmarking** (not wired into the SQL
+  layer); it does **not reload** existing SSTables on construction (fresh per
+  run); compaction is **full size-tiered**, not leveled; the SSTable key index is
+  held fully in memory.
+
+### Where LSM is used in the real world
+RocksDB, LevelDB (the originals), Cassandra, HBase, ScyllaDB, InfluxDB,
+and the storage under many time-series / write-heavy systems.
+
+### LSM vs B+Tree — when to pick which
+- **Pick LSM** for write-heavy or space-sensitive workloads (logging, metrics,
+  messaging, time-series).
+- **Pick B+Tree** for read-heavy / low-latency point lookups and rich range scans
+  (classic OLTP). Our benchmark: LSM ~3.8× smaller, B+Tree ~3.5× faster reads.
+
+### LSM viva Q&A
+**Q: Why are LSM writes fast?** They go into an in-memory sorted buffer and are
+flushed sequentially in bulk; no per-key random disk seek.
+
+**Q: Why can LSM reads be slower?** A key might live in any of several SSTables,
+so a read may probe multiple files (read amplification); bloom filters skip files
+that can't contain the key.
+
+**Q: How does delete work without modifying files?** It writes a tombstone marker;
+the newest entry wins on read, so the tombstone hides older values until
+compaction physically removes them.
+
+**Q: What does compaction achieve?** It merges SSTables, keeps only the newest
+version of each key, and drops tombstones — reducing read & space amplification at
+the cost of write amplification.
+
+**Q: Size-tiered vs leveled?** Size-tiered merges similar-size files (cheaper
+writes, more read/space amp); leveled keeps non-overlapping files per level
+(cheaper reads/space, more write amp). We use size-tiered.
+
+**Q: What's in an SSTable?** Sorted key/value (or tombstone) records, plus an
+in-memory key index and a bloom filter built on open.
+
+**Q: Can a bloom filter be wrong?** It can falsely say "maybe present" (false
+positive → a wasted lookup) but never falsely say "absent" (no false negatives),
+so it's always safe.
+
+**Q: How would you make your LSM crash-safe?** Back the MemTable with its own WAL
+(append each Put/Delete before it's acknowledged), and replay that WAL on startup
+to rebuild the MemTable; reload existing SSTables from the directory.
+
+---
+
+## 11.2 MVCC — complete deep dive
+
+### One-line definition
+**MVCC (Multi-Version Concurrency Control)** keeps **multiple versions of each
+row** so that **reads never block writes and writes never block reads** — each
+transaction sees a consistent **snapshot** of the database as of when it started.
+
+### The core mechanism
+- Every transaction gets a unique, increasing **transaction id / timestamp**.
+- Each row **version** is stamped with two markers:
+  - **xmin** = the id of the transaction that **created** this version,
+  - **xmax** = the id of the transaction that **deleted/replaced** it (empty if
+    still live).
+- A **write** does **not** overwrite — it creates a **new version** (sets the old
+  version's xmax and inserts a new row with a new xmin).
+- Old versions stick around as long as some running transaction might still need
+  to see them.
+
+So a single logical row becomes a **chain of versions** over time.
+
+### Visibility rule (the heart of MVCC)
+A transaction with snapshot `S` **sees** a row version if:
+1. its **xmin** committed **before** `S` started (the version already existed and
+   is committed), **and**
+2. its **xmax** is empty **or** belongs to a transaction that had **not**
+   committed before `S` (the version wasn't yet deleted as far as `S` is
+   concerned).
+
+### Worked timeline
+```
+Row "balance" starts at 1000 (v1: xmin=t0, xmax=—)
+
+t1 (writer): balance = 1000 - 100      → v1.xmax = t1 ; v2: xmin=t1, value=900
+t2 (reader, started BEFORE t1 commits): reads balance
+     → v2 was created by t1 which hasn't committed for t2 → t2 does NOT see v2
+     → t2 sees v1 = 1000   (a consistent, older snapshot — and t2 never waited!)
+After t1 commits, a NEW reader t3 sees v2 = 900.
+```
+No locks were taken for the read; t2 didn't block on t1. That's the MVCC win.
+
+### Snapshot isolation & which anomalies it stops
+Reading from a fixed snapshot gives **Snapshot Isolation (SI)**. It prevents:
+- **Dirty read** (you never see uncommitted data),
+- **Non-repeatable read** (your snapshot is fixed, so re-reading gives the same
+  value),
+- **Phantom reads** (your snapshot doesn't grow).
+
+But plain SI still allows one famous anomaly — **write skew**: two transactions
+read an overlapping set, then each updates a *different* row based on what they
+read, and together they break an invariant (e.g., both doctors go off-call because
+each sees the other still on-call). Fixing this needs **Serializable Snapshot
+Isolation (SSI)** (PostgreSQL) which adds conflict detection on top of SI.
+
+### Write–write conflicts
+Two transactions updating the **same** row can't both win. MVCC uses
+**first-committer-wins** (or **first-updater-wins**): the second one to commit is
+aborted (or blocks), so lost updates are prevented even though reads are
+lock-free.
+
+### Garbage collection
+Dead versions (no running transaction can see them) must be cleaned up or storage
+grows forever. PostgreSQL calls this **VACUUM**; InnoDB uses a **purge** thread.
+This GC overhead is one of MVCC's real costs.
+
+### Two storage styles
+- **Append new versions in place** (PostgreSQL): the table holds all versions;
+  VACUUM reclaims dead ones.
+- **Keep current row + an undo log of old versions** (MySQL InnoDB, Oracle):
+  readers reconstruct old versions from the undo log.
+
+### MVCC vs 2PL (what we use) — side by side
+| Aspect | Strict 2PL (MiniDB) | MVCC |
+| ------ | ------------------- | ---- |
+| Readers vs writers | **block each other** (S vs X conflict) | **never block** each other |
+| Isolation | Serializable | Snapshot (SI); Serializable needs SSI |
+| Storage | one copy per row | **many versions** per row |
+| Extra machinery | lock table + deadlock detection | version chains + visibility + **GC** |
+| Best when | balanced/write-conflict-heavy, simple | read-heavy, high concurrency |
+| Used by | DB2, older SQL Server | PostgreSQL, Oracle, InnoDB |
+
+### Why MiniDB uses 2PL and **not** MVCC
+1. **MVCC was a different extension track (Track B).** The brief says replace 2PL
+   *with* MVCC as one option; we chose **Track C (LSM-tree)**. You implement one
+   extension, not both.
+2. **2PL was the required core.** The mandatory transaction component asks for
+   serializable isolation **via two-phase locking** — which we built directly.
+3. **Simplicity & clean fit with recovery.** 2PL is easy to reason about and pairs
+   naturally with our lock-based, ARIES-style recovery. MVCC needs **versioned
+   tuples** (a different on-disk row format), **snapshot management**, and a
+   **garbage collector** — a lot of orthogonal complexity.
+4. **The trade-off we accept:** with 2PL, readers and writers can block (lower
+   concurrency) but the design is simpler and the isolation is strong. For a
+   teaching DB focused on correctness and the LSM extension, that's the right call.
+
+### How we *would* add MVCC to MiniDB (concrete plan)
+1. **Tuple format:** add `xmin` and `xmax` (transaction ids) to each stored row.
+2. **Transaction manager:** give each transaction a start snapshot (the set of committed txn ids, or a high-watermark, as of its begin).
+3. **Reads:** instead of taking shared locks, walk the version chain and return
+   the version visible under the snapshot rule above.
+4. **Writes:** set the old version's `xmax` and append a new version with the new
+   `xmin`; keep a lightweight write-conflict check (first-committer-wins).
+5. **Garbage collection:** a background pass removing versions older than the
+   oldest live snapshot.
+6. Keep WAL/recovery, but log version creation/deletion instead of in-place edits.
+
+### MVCC viva Q&A
+**Q: What problem does MVCC solve over locking?** Readers don't wait for writers
+(and vice versa), so read-heavy concurrent workloads scale much better.
+
+**Q: How does a transaction see a consistent view?** It reads from a fixed
+**snapshot**; the visibility rule (xmin committed before me, xmax not) decides
+which version of each row it sees.
+
+**Q: Does MVCC remove all locks?** No — reads are lock-free, but **write–write**
+conflicts still need handling (first-committer-wins / brief locks on update).
+
+**Q: What is write skew and does MVCC stop it?** Two transactions read overlapping
+data and update different rows, breaking an invariant. Plain Snapshot Isolation
+does **not** stop it; **Serializable Snapshot Isolation** does.
+
+**Q: What's the cost of MVCC?** Storage for multiple versions + a garbage
+collector (PostgreSQL VACUUM) + more complex visibility logic.
+
+**Q: Why didn't you implement it?** It's a separate extension track (B); we chose
+LSM (C). Our core requirement was 2PL, which is simpler and fits our recovery
+design; MVCC would need versioned rows, snapshots, and GC.
+
+**Q: 2PL vs MVCC in one line?** 2PL = one copy, readers/writers block, simple;
+MVCC = many versions, lock-free reads, complex. We picked 2PL and spent the
+extension budget on the LSM-tree.
