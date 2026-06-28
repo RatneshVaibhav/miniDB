@@ -23,6 +23,7 @@ system.
    - [8.5 MVCC — what it is and why we didn't use it](#85-mvcc--what-it-is-and-why-we-didnt-use-it)
 9. [⭐ SIMPLE VERSION — everything with everyday analogies](#9--simple-version--everything-with-everyday-analogies)
    *(start here if section 8 feels heavy)*
+10. [Algorithms & design decisions (quick reference)](#10-algorithms--design-decisions-quick-reference)
 
 ---
 
@@ -1187,3 +1188,78 @@ changing data, so on restart we **redo** committed work and **undo** unfinished
 work — that's ARIES. Our extension is an LSM-tree: writes go to an in-memory tray,
 get flushed to sorted files, bloom filters skip files on reads, and compaction
 merges files and drops deletions — great for write-heavy, compact storage."
+
+---
+
+# 10. Algorithms & design decisions (quick reference)
+
+A consolidated list of every algorithm/data structure we use and every notable
+engineering decision — handy to revise the night before, and to answer "what
+algorithms did you implement?"
+
+## 10.1 Algorithms & data structures used
+
+| # | Algorithm / data structure | Where (file) | What it does / why |
+| - | -------------------------- | ------------ | ------------------ |
+| 1 | **Slotted page** layout | [storage/table_page.h](src/storage/table_page.h) | stores variable-length rows in a 4 KB page with a slot directory |
+| 2 | **Heap file** (linked list of pages) | [storage/table_heap.cpp](src/storage/table_heap.cpp) | the unordered row store; forward iterator for full scans |
+| 3 | **LRU replacement** (linked list + hash map) | [storage/lru_replacer.h](src/storage/lru_replacer.h) | O(1) "evict the least-recently-used page" for the buffer pool |
+| 4 | **B+Tree** (search, insert with **node split**, root growth) | [index/bplus_tree.cpp](src/index/bplus_tree.cpp) | balanced index, O(log n) point lookups |
+| 5 | **Linked-leaf range scan** | same | ordered scans / returning all duplicates of a key |
+| 6 | **Order-preserving key encoding** (big-endian + sign-bit flip) | [index/index_key.h](src/index/index_key.h) | lets one `memcmp` order ints/strings correctly |
+| 7 | **Bloom filter** (bit array + **double hashing**) | [lsm/bloom_filter.h](src/lsm/bloom_filter.h) | "definitely-not-here" test to skip SSTables on reads |
+| 8 | **FNV-1a hash** + `std::hash` | same | the two base hashes for the bloom filter |
+| 9 | **Recursive-descent parsing** | [sql/parser.cpp](src/sql/parser.cpp) | turns tokens into the AST |
+| 10 | **Volcano / iterator execution** | [execution/executor.cpp](src/execution/executor.cpp) | `Init()`/`Next()` pull-based operator pipeline |
+| 11 | **Nested-loop join** + **index-nested-loop join** | same | the join algorithms (inner uses its index when available) |
+| 12 | **Hash/sorted-map aggregation** (`GROUP BY`) | same (`AggregateExecutor`) | groups rows by key, computes COUNT/SUM/MIN/MAX/AVG |
+| 13 | **Selectivity estimation** (1/NDV; range fraction) | [optimizer/optimizer.cpp](src/optimizer/optimizer.cpp) | guesses result size for cost comparison |
+| 14 | **Cost-based access-path & join-order selection** | same | index-vs-scan and which table is outer |
+| 15 | **Strict two-phase locking (2PL)** | [txn/lock_manager.cpp](src/txn/lock_manager.cpp) | serializable isolation with S/X row locks |
+| 16 | **Wait-for graph + DFS cycle detection** | same (`DetectVictim`) | deadlock detection; abort the youngest |
+| 17 | **WAL + ARIES recovery** (Analysis / Redo / Undo) | [recovery/recovery_manager.cpp](src/recovery/recovery_manager.cpp) | crash recovery |
+| 18 | **Page-LSN guard** (idempotent redo) | [storage/table_heap.cpp](src/storage/table_heap.cpp) | makes replaying the log safe to repeat |
+| 19 | **prev_lsn undo chain** | [recovery/log_record.h](src/recovery/log_record.h) | links a txn's records for rollback |
+| 20 | **LSM MemTable** (balanced BST via `std::map`) | [lsm/lsm_engine.cpp](src/lsm/lsm_engine.cpp) | in-memory sorted write buffer |
+| 21 | **SSTable** (sorted run + in-memory sparse-ish index) | [lsm/sstable.cpp](src/lsm/sstable.cpp) | immutable on-disk sorted file |
+| 22 | **k-way merge compaction** (size-tiered) | [lsm/lsm_engine.cpp](src/lsm/lsm_engine.cpp) | merges SSTables, drops old versions + tombstones |
+| 23 | **Tombstones** (logical delete) | heap + LSM | delete markers over immutable/append-only data |
+| 24 | **Tuple serialization with null bitmap** | [record/tuple.h](src/record/tuple.h) | pack a row into bytes (+ track NULLs) |
+| 25 | **Lazy statistics** (distinct via `std::set`, min/max) | [catalog/catalog.cpp](src/catalog/catalog.cpp) | recomputed only when data is marked dirty |
+
+## 10.2 Key design decisions (and the alternative we rejected)
+
+| Decision we made | Alternative | Why we chose ours |
+| ---------------- | ----------- | ----------------- |
+| **Append-only slots** (RID never changes) | reuse freed slots | stable RIDs → deterministic redo, safe index/lock references |
+| **Buffer pool owns the write-ahead rule** | each operator flushes the log | one choke point = impossible to forget; auditable |
+| **Indexes rebuilt from heap, not logged** | log B+Tree splits/merges (full ARIES) | far simpler recovery; an index is derivable from the heap |
+| **Steal + No-Force** buffer policy | force / no-steal | best performance; the realistic choice (needs redo+undo) |
+| **ARIES-lite: scan whole log** | fuzzy checkpoints + CLRs | simpler; checkpoints only bound recovery *time*, not correctness |
+| **`NEWPAGE` log record** | nothing | keeps the heap page-chain crash-durable under steal |
+| **Fixed 32-byte order-preserving keys** | per-type comparison / variable keys | one `memcmp` orders any index (cost: long strings truncated) |
+| **B+Tree delete tolerates underfull nodes** | merge/redistribute | avoids the trickiest tree code; still fully correct |
+| **Non-unique secondary index** (dup keys + `(key,rid)` delete) | composite key value+rid | simple range-scan lookups; deletes the exact row's entry |
+| **Strict 2PL for isolation** | **MVCC (Track B)** | 2PL was the core requirement; we spent the extension on LSM |
+| **Wait-for graph deadlock detection** | timeouts / wound-wait | precise (only aborts on a real cycle), no false aborts |
+| **Abort the youngest victim** | abort oldest / random | wastes the least work; deterministic, no livelock |
+| **Volcano (row-at-a-time) execution** | **vectorized (Track A)** | clearest teaching model; vectorization was a different track |
+| **Nested-loop / index-nested-loop joins** | hash join / sort-merge join | simplest correct joins; index-NLJ is fast for selective joins |
+| **LSM as a standalone KV engine** | full SQL-over-LSM integration | gives a clean head-to-head benchmark vs the B+Tree (the Track-C ask) |
+| **Size-tiered full compaction** | leveled compaction | simplest to implement; clearly demonstrates space reclamation |
+| **Catalog persisted to a text `.meta` file** | system catalog tables | trivial to write/inspect; schemas are tiny |
+| **4 KB page size** | other sizes | matches typical OS page; simple offset math |
+| **Custom header-only test harness** | GoogleTest | zero external deps; `make test` works anywhere |
+| **Plain Makefile build** | CMake | no extra tooling to install; one command builds everything |
+
+## 10.3 Which extension track we chose (and what the others were)
+The brief offered four extension tracks; **a team picks exactly one**:
+- **Track A — Performance** (vectorized/columnar execution),
+- **Track B — Concurrency** (replace 2PL with MVCC),
+- **Track C — Modern Storage (LSM-tree)** ← **our choice**,
+- **Track D — Distributed** (primary-replica replication).
+
+We chose **Track C** because it contrasts most cleanly with the core B+Tree
+storage and produces a clear, measurable benchmark (write throughput, read
+latency, space amplification). That is also why we use **Volcano** execution (not
+vectorized = Track A) and **2PL** (not MVCC = Track B).
