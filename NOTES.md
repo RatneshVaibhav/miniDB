@@ -21,6 +21,8 @@ system.
    - [8.3 Recovery management & ARIES (in depth)](#83-recovery-management--aries-in-depth)
    - [8.4 LSM-tree (full working)](#84-lsm-tree-full-working)
    - [8.5 MVCC — what it is and why we didn't use it](#85-mvcc--what-it-is-and-why-we-didnt-use-it)
+9. [⭐ SIMPLE VERSION — everything with everyday analogies](#9--simple-version--everything-with-everyday-analogies)
+   *(start here if section 8 feels heavy)*
 
 ---
 
@@ -944,3 +946,244 @@ InnoDB.
 walk the chain and pick the visible version, make writes append a new version, and
 add GC to reclaim dead versions — replacing the shared/exclusive read locks while
 keeping write conflict checks.
+
+---
+
+# 9. ⭐ SIMPLE VERSION — everything with everyday analogies
+
+Forget the jargon for a minute. Here is the whole project explained like a story.
+
+## The big analogy: MiniDB is a giant library
+
+- The **books on the shelves** = your data on **disk**. There's a lot of it, and
+  it's slow to walk to the shelves.
+- Your **desk** = the **buffer pool** (memory). It's fast, but only a few books
+  fit on it at a time.
+- The **librarian** = MiniDB. You ask in English (SQL), the librarian fetches.
+
+That's it. Every feature below is just the library being smart.
+
+---
+
+## Storing data
+
+**Page** = one shelf that holds a fixed amount. Everything is moved around one
+shelf at a time (4 KB). Simple to count and find.
+
+**Row (tuple)** = one book. **RID** = the book's address, like "shelf 5, slot 3."
+
+**Heap file** = a row of shelves where you just put a new book wherever there's a
+gap. Fast to add a book; slow to *find* one (you might check every shelf).
+
+**Buffer pool (your desk)** = you keep the books you're using on the desk. When
+the desk is full and you need a new book, you put away the one you **haven't
+touched in the longest time** (that's **LRU**). A book stays on the desk while
+you're reading it (**pinned**) so it isn't put away mid-read.
+
+---
+
+## Finding data fast: the index (B+Tree)
+
+Imagine a library with no catalogue. To find "Harry Potter" you'd walk every
+shelf. Painful.
+
+**An index is the library catalogue** — a sorted list that tells you exactly which
+shelf+slot a book is on. Our catalogue is a **B+Tree**: it keeps keys sorted and
+points to the address (RID).
+
+- Want one book? The catalogue takes you straight there (a few steps), instead of
+  checking thousands of shelves.
+- Want "all books from A to C"? The catalogue entries are sorted and linked, so
+  you just read along the row.
+- When a catalogue drawer gets too full, it **splits** into two drawers — that's
+  how it stays quick to search.
+
+**Primary key index** = a catalogue where every ID is unique. **Secondary index**
+= a catalogue by, say, "branch", where many books share the same branch — so one
+entry can list many books.
+
+---
+
+## Understanding your request: parser
+
+You say: `SELECT name FROM students WHERE id = 7`.
+
+The **parser** is like a translator. It breaks your sentence into words, checks
+the grammar, and turns it into a clear to-do list the librarian can act on. If you
+write nonsense, it says "I don't understand this."
+
+---
+
+## Choosing the smart way: the optimizer
+
+The optimizer is a **GPS**. There are several routes to the same destination; it
+picks the fastest using what it knows about traffic.
+
+- "Find the student with `id = 7`." → IDs are in the catalogue (index), so **go
+  straight there**. (Index scan.)
+- "Find students in `branch = 'cse'`" when there's **no** catalogue for branch →
+  it has to **walk every shelf**. (Table scan.)
+- It guesses how many results you'll get (using simple stats like "how many
+  distinct IDs are there") and picks whichever is less work.
+- Type `EXPLAIN` before a query and the GPS *shows you the route it chose* and
+  why.
+
+For a **join** (combining two tables), the GPS decides **which table to loop over
+first** — it loops over the small one and uses the other's catalogue to jump
+straight to matches. Less walking.
+
+---
+
+## Doing the work: execution (the assembly line)
+
+Running a query is an **assembly line**. Each worker does one small job and hands
+**one item at a time** to the next worker:
+
+```
+[Scan] → [Filter] → [Join] → [Group/Count] → [Pick columns] → you
+```
+
+- **Scan** worker: brings books off the shelves one by one.
+- **Filter** worker: throws away the ones that don't match `WHERE`.
+- **Join** worker: pairs each book with its matches from the other table.
+- **Aggregate** worker: counts/sums them up.
+- **Projection** worker: keeps only the columns you asked for.
+
+Why one-at-a-time? So you never need a huge pile of half-results sitting around —
+items flow down the line. (The only worker that must wait for *everything* first
+is "count/sum", because you can't total a column until you've seen every row.)
+
+---
+
+## Transactions: all-or-nothing
+
+A **transaction** is like a **bank transfer**: take ₹100 from A, add ₹100 to B.
+Both must happen, or neither. If the power dies in the middle, you must not lose
+₹100.
+
+- `BEGIN` = start the transfer.
+- `COMMIT` = "done, make it permanent."
+- `ROLLBACK` = "cancel, undo everything I did."
+
+**Locks** are **"do not disturb" signs** on a row:
+- a **shared** sign = "others may read this too" (many readers OK),
+- an **exclusive** sign = "I'm changing this, nobody else touch it."
+You hold your signs until the transfer ends. This stops two people corrupting the
+same row at once.
+
+**Deadlock** = two people each holding a door the other needs, both waiting
+forever. MiniDB notices the standoff and tells the **newer** person to give up and
+retry, so the other can finish.
+
+---
+
+## ⭐ Recovery: surviving a power cut (your viva topic, simple version)
+
+**The diary idea.** Before the librarian changes anything, they **write what
+they're about to do in a diary first**. The diary (the **WAL** — Write-Ahead Log)
+is always saved to disk *before* the actual change.
+
+Why? Because the **desk (memory) is wiped out by a power cut**, but the **diary on
+disk survives.**
+
+When you `COMMIT`, the librarian makes 100% sure the **diary entry is saved** —
+but they're lazy about updating the actual shelves (that can happen later). This
+is fine *because of the diary*.
+
+Now the power cuts out. On restart, the librarian reads the diary and does two
+things:
+
+1. **REDO** — "I see in the diary that these changes were confirmed (committed),
+   but maybe the shelves weren't updated yet. Let me re-apply them." → **committed
+   data is never lost.** This is needed because we were *lazy about the shelves*
+   (the fancy name is **no-force**).
+
+2. **UNDO** — "I see some changes in the diary that were **never committed**
+   (someone was mid-transfer). Some of those might have already reached the
+   shelves. Let me reverse them." → **half-finished work disappears.** This is
+   needed because the desk sometimes *spills unfinished work onto the shelves to
+   make room* (the fancy name is **steal**).
+
+That two-step "re-apply the confirmed, reverse the unconfirmed" is the famous
+**ARIES** recovery. Our `.crash` command is literally a fake power cut: it throws
+away the desk without saving, leaving only the diary — then recovery rebuilds
+everything correctly.
+
+**Memory hook:**
+- **No-force → REDO** (we didn't save shelves at commit, so re-apply from diary).
+- **Steal → UNDO** (unfinished work leaked to shelves, so reverse it).
+
+---
+
+## ⭐ LSM-tree: the fast-writing storage (your viva topic, simple version)
+
+Compare two ways to keep notes.
+
+**B+Tree way (filing immediately):** every new note, you walk to the right folder
+and file it in order *right now*. Tidy for reading, but lots of walking back and
+forth (slow random writes).
+
+**LSM way (inbox tray, then batch-file):**
+1. New notes go into a **tray on your desk** (the **MemTable**) — instant, no
+   walking. The tray keeps them sorted.
+2. When the tray is full, you **file the whole tray at once** into a new **sorted
+   folder** (an **SSTable**) and start a fresh tray. Filing a whole batch in one
+   trip is fast.
+3. Over time you get a **stack of sorted folders**, newest on top.
+
+**Finding a note:** check the **tray first** (newest), then the folders **newest
+to oldest**. Stop at the first place you find it.
+
+**The clever label (bloom filter):** each folder has a sticker that can instantly
+tell you **"this name is definitely NOT in here"** — so you skip opening folders
+that can't have your note. (It can sometimes say "maybe" wrongly, but never says
+"no" wrongly — so it's safe.)
+
+**Deleting (tombstone):** you can't rub out a note in an already-filed folder. So
+you drop a **"CANCELLED" sticky note** on top. When reading, the newest note wins,
+so the cancellation hides the old note.
+
+**Compaction (the big tidy-up):** when too many folders pile up, you **merge them
+into one**, keeping only the **newest version of each note** and **throwing away
+the CANCELLED ones**. This frees space and means fewer folders to search.
+
+**The trade-off (one line):** LSM writes are fast and storage is small, but reads
+may peek into several folders. B+Tree reads are faster but writes are slower and
+take more space. *Same data, opposite strengths.* Our benchmark proves it: LSM
+~3.8× smaller on disk, B+Tree ~3.5× faster reads.
+
+---
+
+## MVCC: why we *didn't* use it (simple version)
+
+**The problem with locks:** if I put an "I'm editing" sign on a row, readers have
+to **wait** until I'm done.
+
+**MVCC's trick:** instead of making readers wait, keep **old photocopies**. While
+I edit a fresh copy, readers happily read the previous copy. Nobody waits. (This
+is how PostgreSQL works.)
+
+**Why we used locks (2PL) instead of MVCC:**
+- MVCC was a **different optional project** (Track B). We chose the **LSM-tree**
+  project (Track C) instead — you only do one.
+- The required transaction part specifically asked for **two-phase locking**,
+  which we did.
+- MVCC needs keeping many old copies + a cleaner to delete them later + extra
+  bookkeeping — a lot more complexity. Locks are simpler and fit our crash-recovery
+  design neatly.
+
+So: **locks = simple, readers may wait; MVCC = complex, nobody waits.** We picked
+simple, and spent our "extra" effort on the LSM-tree.
+
+---
+
+### 30-second summary you can say out loud
+"MiniDB stores rows on disk in fixed pages and caches hot ones in memory. A
+B+Tree index lets it jump straight to a row instead of scanning. SQL is parsed,
+then an optimizer picks index-vs-scan and join order by cost, and an
+assembly-line of operators runs it. Transactions use locks (strict 2PL) for
+all-or-nothing, serializable behaviour. For crashes we write a diary (WAL) before
+changing data, so on restart we **redo** committed work and **undo** unfinished
+work — that's ARIES. Our extension is an LSM-tree: writes go to an in-memory tray,
+get flushed to sorted files, bloom filters skip files on reads, and compaction
+merges files and drops deletions — great for write-heavy, compact storage."
